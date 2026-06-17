@@ -153,9 +153,8 @@ class MyAxes:
         if not self.is_3d:
             return
         ff = self.data.float_format
-        # PGFPlots measures the azimuth from the opposite horizontal reference
-        # direction compared to Matplotlib's mplot3d camera angle.
-        azim = 180 - self.obj.azim  # type: ignore[attr-defined]
+        # PGFPlots' 3D azimuth is rotated 90 degrees relative to mplot3d.
+        azim = self.obj.azim + 90  # type: ignore[attr-defined]
         elev = self.obj.elev  # type: ignore[attr-defined]
         self.data.current_axis_options.add("view={" + f"{azim:{ff}}" + "}{" + f"{elev:{ff}}" + "}")
 
@@ -436,33 +435,21 @@ class MyAxes:
         return ""
 
     def _get_ticks(self) -> None:
-        if self.is_3d:
-            self._get_3d_ticks()
-            return
-
-        self._add_tick_options("x", self.obj.get_xticks(), self.obj.get_xticklabels())
-        self._add_tick_options("y", self.obj.get_yticks(), self.obj.get_yticklabels())
-        self._add_tick_options(
-            "minor x",
-            self.obj.get_xticks(minor=True),
-            self.obj.get_xticklabels(minor=True),
-        )
-        self._add_tick_options(
-            "minor y",
-            self.obj.get_yticks(minor=True),
-            self.obj.get_yticklabels(minor=True),
-        )
-
-    def _get_3d_ticks(self) -> None:
-        axes3d = cast("Axes3D", self.obj)
-        for axis_name, ticks, ticklabels in (
+        tick_iterators = [
             ("x", self.obj.get_xticks(), self.obj.get_xticklabels()),
             ("y", self.obj.get_yticks(), self.obj.get_yticklabels()),
-            ("z", axes3d.get_zticks(), axes3d.get_zticklabels()),
             ("minor x", self.obj.get_xticks(minor=True), self.obj.get_xticklabels(minor=True)),
             ("minor y", self.obj.get_yticks(minor=True), self.obj.get_yticklabels(minor=True)),
-            ("minor z", axes3d.get_zticks(minor=True), axes3d.get_zticklabels(minor=True)),
-        ):
+        ]
+
+        if self.is_3d:
+            axes3d = cast("Axes3D", self.obj)
+            tick_iterators += [
+                ("z", axes3d.get_zticks(), axes3d.get_zticklabels()),
+                ("minor z", axes3d.get_zticks(minor=True), axes3d.get_zticklabels(minor=True)),
+            ]
+
+        for axis_name, ticks, ticklabels in tick_iterators:
             self._add_tick_options(axis_name, ticks, ticklabels)
 
     def _add_tick_options(
