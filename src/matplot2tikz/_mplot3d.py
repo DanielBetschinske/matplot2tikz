@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
 import numpy as np
 from matplotlib.path import Path
@@ -14,7 +15,7 @@ from mpl_toolkits.mplot3d.art3d import (
     Text3D,
 )
 
-from . import _files, _line2d
+from . import _color_norm, _files, _line2d
 from . import _path as mypath
 from ._axes import _mpl_cmap2pgf_cmap
 from ._clip3d import (
@@ -33,8 +34,13 @@ if TYPE_CHECKING:
 
     from ._tikzdata import TikzData
 
+ARRAY_3D_DIMENSIONS = 3
 MIN_POLYGON_VERTICES = 3
+MIN_GRID_SIZE = 2
+MAX_META_BOUNDARY_VARIABLES = 128
+QUAD_VERTICES = 4
 RGBA_LENGTH = 4
+XYZ_COLUMNS = 3
 HashableColor = tuple[float, ...]
 LineStyle = str | tuple[float, Sequence[float] | None] | None
 T = TypeVar("T")
@@ -68,6 +74,18 @@ class Poly3DColorGroup:
 class Quiver3DData:
     coordinates: np.ndarray
     options: list[str]
+
+
+@dataclass
+class RegularSurfaceGrid:
+    rows: int
+    cols: int
+    coordinates: np.ndarray
+    point_meta: np.ndarray | None
+    point_meta_limits: tuple[float, float] | None
+
+
+SurfaceShaderMode = Literal["flat_mean", "flat_corner", "interp"]
 
 
 def is_quiver3d_collection(obj: Collection) -> bool:
@@ -403,21 +421,40 @@ def _draw_clipped_path3dcollection(
 
 
 def draw_poly3dcollection(data: TikzData, obj: Collection) -> list[str]:
-    """Returns PGFPlots patch-plot code for 3D polygon collections."""
+    """Returns PGFPlots code for 3D polygon collections.
+
+    Regular rectangular quad grids from plot_surface() are exported as a PGFPlots
+    surf plot. This avoids duplicating all shared vertices and avoids the large
+    patch table. Irregular polygon collections still use the generic patch
+    fallback.
+    """
     indexed_segments = _poly_segments_for_export(data, get_poly3d_segments(obj))
+
     if not indexed_segments:
         return []
 
-    data.pgfplots_libs.add("patchplots")
     array = obj.get_array()
+
     if array is not None:
         color_data = np.ma.getdata(array)
         if len(color_data) > max(index for index, _ in indexed_segments):
             segment_colors = [
                 (vertices, float(color_data[index])) for index, vertices in indexed_segments
             ]
+            cmap = obj.get_cmap()
+            if cmap is not None:
+                mycolormap, is_custom_cmap = _mpl_cmap2pgf_cmap(cmap, data)
+                colormap_option = "colormap" + ("=" if is_custom_cmap else "/") + mycolormap
+                data.current_axis_options.add(colormap_option)
+
+            regular_surface = _regular_surface_grid_from_segments(data, obj, segment_colors)
+            if regular_surface is not None:
+                return _draw_regular_surface_grid(data, obj, regular_surface)
+
+            data.pgfplots_libs.add("patchplots")
             return _draw_poly3dcollection_colormapped(data, obj, segment_colors)
 
+    data.pgfplots_libs.add("patchplots")
     return _draw_poly3dcollection_explicit_colors(data, obj, indexed_segments)
 
 
@@ -444,6 +481,275 @@ def _poly_segments_for_export(
         if len(clipped) >= MIN_POLYGON_VERTICES:
             indexed_segments.append((index, clipped))
     return indexed_segments
+
+
+def _regular_surface_grid_from_segments(
+    data: TikzData,
+    obj: Collection,
+    segment_colors: list[tuple[np.ndarray, float]],
+) -> RegularSurfaceGrid | None:
+    """Detect ordinary rectangular plot_surface output.
+
+    This is intentionally narrow. It only accepts unclipped quad collections
+    whose unique vertices form a complete rectangular x/y grid. Everything else
+    falls back to the existing patch exporter.
+
+    """
+    if _clip_box(data) is not None or not segment_colors:
+        return None
+
+    color_values = np.asarray([color_value for _, color_value in segment_colors], dtype=float)
+
+    try:
+        candidate_faces = np.asarray([vertices for vertices, _ in segment_colors], dtype=float)
+    except ValueError:
+        candidate_faces = None
+
+    # Only optimize quad surfaces.
+    if (
+        candidate_faces is None
+        or candidate_faces.ndim != ARRAY_3D_DIMENSIONS
+        or candidate_faces.shape[1:] != (QUAD_VERTICES, XYZ_COLUMNS)
+    ):
+        return None
+
+    faces = candidate_faces
+    n_faces = faces.shape[0]
+
+    flat_points = faces.reshape(-1, XYZ_COLUMNS)
+
+    # A PGFPlots surf is a height field z = f(x, y), so each unique x/y pair
+    # must map to exactly one z value.
+    xy, first_indices, inverse = np.unique(
+        flat_points[:, :2], axis=0, return_index=True, return_inverse=True
+    )
+    z_values = flat_points[first_indices, 2]
+    if not np.array_equal(flat_points[:, 2], z_values[inverse]):
+        return None
+
+    points = np.column_stack([xy, z_values])
+
+    x_values = np.unique(points[:, 0])
+    y_values = np.unique(points[:, 1])
+
+    cols = len(x_values)
+    rows = len(y_values)
+
+    # The unique points must fill a full rectangular grid and number of quads must match a
+    # rectangular cell grid.
+    if (
+        rows < MIN_GRID_SIZE
+        or cols < MIN_GRID_SIZE
+        or rows * cols != len(points)
+        or n_faces != (rows - 1) * (cols - 1)
+    ):
+        return None
+
+    cells = _regular_surface_cell_indices(faces, x_values, y_values)
+    if cells is None or len(cells) != n_faces:
+        return None
+
+    # PGFPlots wants row-wise order: y outer loop, x inner loop.
+    order = np.lexsort((points[:, 0], points[:, 1]))
+    coordinates = points[order]
+
+    has_transformed_meta = _color_norm.has_transformed_color_meta(obj)
+    point_meta_limits = _color_norm.point_meta_limits(obj)
+
+    shader_mode = _surface_shader_mode(data.shader)
+
+    point_meta: np.ndarray | None
+    if shader_mode == "interp":
+        point_meta = _color_norm.color_meta_values(obj, coordinates[:, 2])
+    elif shader_mode == "flat_corner":
+        cell_meta = _color_norm.color_meta_values(obj, color_values)
+        point_meta = _regular_surface_point_meta_from_corner_cells(cell_meta, cells, rows, cols)
+    elif has_transformed_meta:
+        cell_meta = _color_norm.color_meta_values(obj, color_values)
+        point_meta = _regular_surface_point_meta_from_cells(cell_meta, cells, rows, cols)
+    else:
+        point_meta = None
+
+    can_export_surface = point_meta is not None or (
+        shader_mode == "flat_mean" and not has_transformed_meta
+    )
+    return (
+        RegularSurfaceGrid(
+            rows=rows,
+            cols=cols,
+            coordinates=coordinates,
+            point_meta=point_meta,
+            point_meta_limits=point_meta_limits,
+        )
+        if can_export_surface
+        else None
+    )
+
+
+def _regular_surface_cell_indices(
+    faces: np.ndarray, x_values: np.ndarray, y_values: np.ndarray
+) -> np.ndarray | None:
+    x_indices = np.searchsorted(x_values, faces[:, :, 0])
+    y_indices = np.searchsorted(y_values, faces[:, :, 1])
+
+    x_min = x_indices.min(axis=1)
+    x_max = x_indices.max(axis=1)
+    y_min = y_indices.min(axis=1)
+    y_max = y_indices.max(axis=1)
+    if not (np.all(x_max == x_min + 1) and np.all(y_max == y_min + 1)):
+        return None
+
+    cols = len(x_values)
+    actual_vertices = np.sort(y_indices * cols + x_indices, axis=1)
+    expected_vertices = np.sort(
+        np.column_stack(
+            [
+                y_min * cols + x_min,
+                y_min * cols + x_max,
+                y_max * cols + x_min,
+                y_max * cols + x_max,
+            ]
+        ),
+        axis=1,
+    )
+    if not np.array_equal(actual_vertices, expected_vertices):
+        return None
+
+    cells = y_min * (cols - 1) + x_min
+    if len(np.unique(cells)) != len(cells):
+        return None
+    return cells
+
+
+def _regular_surface_point_meta_from_cells(
+    cell_meta: np.ndarray,
+    cells: np.ndarray,
+    rows: int,
+    cols: int,
+) -> np.ndarray | None:
+    cell_meta_grid = np.empty((rows - 1) * (cols - 1), dtype=float)
+    cell_meta_grid.fill(np.nan)
+    cell_meta_grid[cells] = cell_meta
+
+    if not np.all(np.isfinite(cell_meta_grid)):
+        return None
+
+    cell_meta_matrix = cell_meta_grid.reshape(rows - 1, cols - 1)
+    # PGFPlots' flat-mean shader averages transformed vertex meta per cell, while
+    # Matplotlib stores one transformed color value per face. Reconstruct vertex
+    # meta so each PGFPlots cell average matches the original face value; boundary
+    # vertices can therefore intentionally fall outside the point meta limits.
+    target_meta = np.zeros((rows, cols), dtype=float)
+    target_counts = np.zeros((rows, cols), dtype=float)
+    for row_offset, col_offset in ((0, 0), (0, 1), (1, 0), (1, 1)):
+        target_meta[row_offset : row_offset + rows - 1, col_offset : col_offset + cols - 1] += (
+            cell_meta_matrix
+        )
+        target_counts[row_offset : row_offset + rows - 1, col_offset : col_offset + cols - 1] += 1.0
+    target_meta /= target_counts
+
+    def point_meta_from_boundary(boundary_meta: np.ndarray) -> np.ndarray:
+        point_meta = np.empty((rows, cols), dtype=float)
+        point_meta[0, :] = boundary_meta[:cols]
+        point_meta[1:, 0] = boundary_meta[cols:]
+        for row in range(rows - 1):
+            for col in range(cols - 1):
+                point_meta[row + 1, col + 1] = (
+                    4.0 * cell_meta_matrix[row, col]
+                    - point_meta[row, col]
+                    - point_meta[row, col + 1]
+                    - point_meta[row + 1, col]
+                )
+        return point_meta
+
+    boundary_count = rows + cols - 1
+    boundary_meta = np.concatenate([target_meta[0, :], target_meta[1:, 0]])
+    if boundary_count <= MAX_META_BOUNDARY_VARIABLES:
+        zero_boundary_meta = np.zeros(boundary_count, dtype=float)
+        base_meta = point_meta_from_boundary(zero_boundary_meta).reshape(-1)
+        design = np.empty((rows * cols, boundary_count), dtype=float)
+        for index in range(boundary_count):
+            unit_boundary_meta = np.zeros(boundary_count, dtype=float)
+            unit_boundary_meta[index] = 1.0
+            design[:, index] = point_meta_from_boundary(unit_boundary_meta).reshape(-1) - base_meta
+        with suppress(np.linalg.LinAlgError):
+            boundary_meta = np.linalg.lstsq(
+                design, target_meta.reshape(-1) - base_meta, rcond=None
+            )[0]
+
+    return point_meta_from_boundary(boundary_meta).reshape(-1)
+
+
+def _regular_surface_point_meta_from_corner_cells(
+    cell_meta: np.ndarray,
+    cells: np.ndarray,
+    rows: int,
+    cols: int,
+) -> np.ndarray | None:
+    cell_meta_grid = np.empty((rows - 1) * (cols - 1), dtype=float)
+    cell_meta_grid.fill(np.nan)
+    cell_meta_grid[cells] = cell_meta
+
+    if not np.all(np.isfinite(cell_meta_grid)):
+        return None
+
+    cell_meta_matrix = cell_meta_grid.reshape(rows - 1, cols - 1)
+    point_meta = np.empty((rows, cols), dtype=float)
+    point_meta[:-1, :-1] = cell_meta_matrix
+    point_meta[:-1, -1] = cell_meta_matrix[:, -1]
+    point_meta[-1, :-1] = cell_meta_matrix[-1, :]
+    point_meta[-1, -1] = cell_meta_matrix[-1, -1]
+    return point_meta.reshape(-1)
+
+
+def _draw_regular_surface_grid(
+    data: TikzData,
+    obj: Collection,
+    surface: RegularSurfaceGrid,
+) -> list[str]:
+    options = [
+        "surf",
+        f"mesh/rows={surface.rows}",
+        f"mesh/cols={surface.cols}",
+        "mesh/ordering=rowwise",
+        "z buffer=sort",
+    ]
+
+    if data.shader != "none":
+        options.append(_shader_option(data.shader))
+
+    if surface.point_meta is not None:
+        options.append(r"point meta=\thisrow{meta}")
+    else:
+        options.append("point meta=z")
+
+    if surface.point_meta_limits is not None:
+        ff = data.float_format
+        meta_min, meta_max = surface.point_meta_limits
+        options.extend(
+            [
+                f"point meta min={meta_min:{ff}}",
+                f"point meta max={meta_max:{ff}}",
+            ]
+        )
+
+    options.extend(_poly3d_collection_options(data, obj))
+
+    column_names = ["x", "y", "z"]
+    coordinates = surface.coordinates
+
+    if surface.point_meta is not None:
+        column_names.append("meta")
+        coordinates = np.column_stack([coordinates, surface.point_meta])
+
+    return addplot_table(
+        data,
+        coordinates,
+        command="addplot3",
+        options=options,
+        column_names=column_names,
+        externalize_min_rows=len(coordinates) + 1,
+    )
 
 
 def draw_contour3d(data: TikzData, obj: Collection) -> list[str]:
@@ -541,11 +847,8 @@ def _draw_poly3dcollection_colormapped(
     data: TikzData, obj: Collection, segment_colors: list[tuple[np.ndarray, float]]
 ) -> list[str]:
     content: list[str] = []
-    cmap = obj.get_cmap()
-    if cmap is not None:
-        mycolormap, is_custom_cmap = _mpl_cmap2pgf_cmap(cmap, data)
-        colormap_option = "colormap" + ("=" if is_custom_cmap else "/") + mycolormap
-        data.current_axis_options.add(colormap_option)
+
+    has_transformed_meta = _color_norm.has_transformed_color_meta(obj)
 
     # Triangulate if shading is enabled and any polygon has more than 4 vertices, since PGFPlots
     # only supports shading for triangles and bilinear shading for quads.
@@ -556,21 +859,38 @@ def _draw_poly3dcollection_colormapped(
             for segment in _triangulate_polygon(vertices)
         ]
 
+    if data.shader == "none" and has_transformed_meta:
+        transformed_values = _color_norm.color_meta_values(
+            obj, [color_value for _, color_value in segment_colors]
+        )
+        segment_colors = [
+            (segment, float(color_value))
+            for (segment, _), color_value in zip(segment_colors, transformed_values, strict=True)
+        ]
+
     for vertex_count, group in _group_segments_by_vertex_count(segment_colors):
         grouped_segments = [segment for segment, _ in group]
         grouped_color_data = [color_value for _, color_value in group]
         options = _poly3d_base_options(data, vertex_count, use_shader=data.shader != "none")
         options.extend(_poly3d_collection_options(data, obj))
+        if has_transformed_meta:
+            options.extend(_color_norm.point_meta_options(data, obj))
 
         if data.shader != "none":
             options.append(r"point meta=\thisrow{meta}")
             options.append(_patch_table(data, grouped_segments))
+            point_meta_segments = _poly3d_z_point_meta(grouped_segments)
+            if has_transformed_meta:
+                point_meta_segments = [
+                    _color_norm.color_meta_values(obj, point_meta)
+                    for point_meta in point_meta_segments
+                ]
             content.extend(
                 _poly3d_addplot(
                     data,
                     grouped_segments,
                     options,
-                    point_meta_segments=_poly3d_z_point_meta(grouped_segments),
+                    point_meta_segments=point_meta_segments,
                 )
             )
         else:
@@ -682,6 +1002,19 @@ def _poly3d_patch_type_options(use_shader: bool, vertex_count: int) -> list[str]
 def _shader_option(shader: str) -> str:
     shader = shader.removeprefix(",").strip()
     return shader if shader.startswith("shader=") else f"shader={shader}"
+
+
+def _surface_shader_mode(shader: str) -> SurfaceShaderMode:
+    if shader == "none":
+        return "flat_mean"
+
+    shader_value = _shader_option(shader).removeprefix("shader=").strip()
+    shader_value = " ".join(shader_value.split())
+    if shader_value in {"interp", "faceted interp"}:
+        return "interp"
+    if shader_value == "flat corner":
+        return "flat_corner"
+    return "flat_mean"
 
 
 def _poly3d_collection_options(data: TikzData, obj: Collection) -> list[str]:

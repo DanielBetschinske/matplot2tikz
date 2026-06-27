@@ -9,6 +9,18 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
+from examples.plot_3d_gallery import (
+    EXAMPLES as GALLERY_EXAMPLES,
+)
+from examples.plot_3d_gallery import (
+    exp_lognorm_surface as gallery_exp_lognorm_surface,
+)
+from examples.plot_3d_gallery import (
+    exp_lognorm_surface_interp as gallery_exp_lognorm_surface_interp,
+)
+from examples.plot_3d_gallery import (
+    surface_wireframe as gallery_surface_wireframe,
+)
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from typing_extensions import NotRequired, TypedDict, Unpack
@@ -23,7 +35,15 @@ if TYPE_CHECKING:
     from mpl_toolkits.mplot3d import Axes3D
 
 Clip3DMode = Literal["none", "hide", "clip"]
-ShaderMode = Literal["none", "interp"]
+ShaderMode = Literal[
+    "none",
+    "flat",
+    "interp",
+    "faceted",
+    "flat corner",
+    "flat mean",
+    "faceted interp",
+]
 
 
 class _TikzCodeOptions(TypedDict):
@@ -146,9 +166,9 @@ def plot_surface_and_wireframe() -> Figure:
 def plot_bar3d() -> Figure:
     fig = plt.figure()
     ax = cast("Axes3D", fig.add_subplot(111, projection="3d"))
-    xpos, ypos = np.meshgrid([0.0, 1.1, 2.2], [0.0, 1.0])
-    xpos = xpos.ravel()
-    ypos = ypos.ravel()
+    xpos_grid_grid, ypos_grid_grid = np.meshgrid([0.0, 1.1, 2.2], [0.0, 1.0])
+    xpos = xpos_grid_grid.ravel()
+    ypos = ypos_grid_grid.ravel()
     zpos = np.zeros_like(xpos)
     dx = np.array([0.55, 0.75, 0.65, 0.55, 0.75, 0.65])
     dy = np.array([0.55, 0.45, 0.65, 0.75, 0.5, 0.6])
@@ -224,13 +244,136 @@ def test_surface_and_wireframe() -> None:
     assert_equality(plot_surface_and_wireframe, "test_3d_surface_and_wireframe_reference.tex")
 
 
+def test_regular_3d_surface_uses_compact_surf_grid() -> None:
+    code = _tikz_code(plot_surface_and_wireframe)
+
+    assert code.count("\\addplot3 [surf") == 1
+    assert "mesh/rows=20" in code
+    assert "mesh/cols=20" in code
+    assert "colormap/viridis" in code
+    assert "point meta=z" in code
+    assert "point meta min=-0.96774984" in code
+    assert "point meta max=0.96504196" in code
+    assert "shader=faceted" not in code
+    assert "patch table with point meta" not in code
+
+
+@pytest.mark.parametrize(
+    ("shader", "shader_option"),
+    [
+        ("none", None),
+        ("flat", "shader=flat"),
+        ("flat mean", "shader=flat mean"),
+        ("faceted", "shader=faceted"),
+    ],
+)
+def test_gallery_exp_lognorm_surface_flat_mean_shaders_export_face_meta_and_colorbar(
+    shader: ShaderMode, shader_option: str | None
+) -> None:
+    code = _tikz_code(gallery_exp_lognorm_surface, shader=shader)
+
+    assert "\\addplot3 [surf" in code
+    assert "zmode=log" in code
+    assert "colorbar" in code
+    assert r"point meta=\thisrow{meta}" in code
+    assert "point meta min=0" in code
+    assert "point meta max=1" in code
+    assert "ytick={0.26558902,0.84123529}" in code
+    assert r"\(\displaystyle {10^{1}}\)" in code
+    assert r"\(\displaystyle {10^{2}}\)" in code
+    if shader_option is None:
+        assert "shader=flat" not in code
+        assert "shader=interp" not in code
+    else:
+        assert shader_option in code
+
+    point_meta = _regular_surface_point_meta_grid(code, rows=4, cols=4)
+    actual_cell_meta = (
+        point_meta[:-1, :-1] + point_meta[:-1, 1:] + point_meta[1:, :-1] + point_meta[1:, 1:]
+    ) / 4.0
+
+    assert float(np.min(point_meta)) == pytest.approx(-0.125)
+    assert float(np.max(point_meta)) == pytest.approx(1.125)
+
+    expected_cell_meta = np.array(
+        [
+            [0.0, 0.25, 0.5],
+            [0.25, 0.5, 0.75],
+            [0.5, 0.75, 1.0],
+        ]
+    )
+    np.testing.assert_allclose(actual_cell_meta, expected_cell_meta, atol=1.0e-12)
+
+
+def test_gallery_exp_lognorm_surface_flat_corner_exports_corner_meta_and_colorbar() -> None:
+    code = _tikz_code(gallery_exp_lognorm_surface, shader="flat corner")
+
+    assert "\\addplot3 [surf" in code
+    assert "shader=flat corner" in code
+    assert "zmode=log" in code
+    assert "colorbar" in code
+    assert r"point meta=\thisrow{meta}" in code
+    assert "point meta min=0" in code
+    assert "point meta max=1" in code
+    assert "ytick={0.26558902,0.84123529}" in code
+    assert r"\(\displaystyle {10^{1}}\)" in code
+    assert r"\(\displaystyle {10^{2}}\)" in code
+
+    point_meta = _regular_surface_point_meta_grid(code, rows=4, cols=4)
+    expected_cell_meta = np.array(
+        [
+            [0.0, 0.25, 0.5],
+            [0.25, 0.5, 0.75],
+            [0.5, 0.75, 1.0],
+        ]
+    )
+    np.testing.assert_allclose(point_meta[:-1, :-1], expected_cell_meta, atol=1.0e-12)
+
+
+def test_gallery_exp_lognorm_surface_interp_entry_uses_interp_shader() -> None:
+    assert any(
+        name == "exp_lognorm_surface_interp"
+        and plot is gallery_exp_lognorm_surface_interp
+        and clip_3d == "none"
+        and shader == "interp"
+        for name, _title, plot, clip_3d, shader in GALLERY_EXAMPLES
+    )
+
+
+@pytest.mark.parametrize(
+    ("shader", "shader_option"),
+    [("interp", "shader=interp"), ("faceted interp", "shader=faceted interp")],
+)
+def test_gallery_exp_lognorm_surface_interp_shaders_export_vertex_meta_and_colorbar(
+    shader: ShaderMode, shader_option: str
+) -> None:
+    code = _tikz_code(gallery_exp_lognorm_surface_interp, shader=shader)
+
+    assert "\\addplot3 [surf" in code
+    assert shader_option in code
+    assert r"point meta=\thisrow{meta}" in code
+    assert "point meta min=0" in code
+    assert "point meta max=1" in code
+    assert "ytick={0,0.38376418,0.76752836}" in code
+    assert r"\(\displaystyle {10^{0}}\)" in code
+    assert r"\(\displaystyle {10^{1}}\)" in code
+    assert r"\(\displaystyle {10^{2}}\)" in code
+    assert "x y z meta\n" in code
+
+    point_meta = _regular_surface_point_meta_grid(code, rows=4, cols=4)
+    expected_point_meta = np.fromfunction(lambda row, col: (row + col) / 6.0, (4, 4))
+    np.testing.assert_allclose(point_meta, expected_point_meta, atol=1.0e-8)
+    assert float(np.min(point_meta)) == pytest.approx(0.0)
+    assert float(np.max(point_meta)) == pytest.approx(1.0)
+
+
 def test_3d_surface_shader_option() -> None:
     code = _tikz_code(plot_surface_and_wireframe, shader="interp")
 
     assert "shader=interp" in code
-    assert "patch type=bilinear" in code
+    assert "\\addplot3 [surf" in code
     assert r"point meta=\thisrow{meta}" in code
-    assert "x y z meta\\\\" in code
+    assert "x y z meta\n" in code
     assert "patch table with point meta" not in code
     assert "patch type=polygon,\nvertex count=4" not in code
 
@@ -350,6 +493,98 @@ def test_poly3d_colormap_keeps_colors_aligned_after_filtering() -> None:
     assert "0 1 2 1\\\\" in code
     assert "3 4 5 2\\\\" in code
     assert "0 1 2 0\\\\" not in code
+
+
+def test_poly3d_lognorm_transforms_patch_meta_and_colorbar_ticks() -> None:
+    fig = plt.figure()
+    ax = cast("Axes3D", fig.add_subplot(111, projection="3d"))
+    collection = Poly3DCollection(
+        [
+            np.array([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]]),
+            np.array([[1.0, 0.0, 10.0], [2.0, 0.0, 10.0], [1.0, 1.0, 10.0]]),
+            np.array([[2.0, 0.0, 100.0], [3.0, 0.0, 100.0], [2.0, 1.0, 100.0]]),
+        ],
+        edgecolor="black",
+    )
+    collection.set_array(np.array([1.0, 10.0, 100.0]))
+    collection.set_cmap(plt.get_cmap("viridis"))
+    collection.set_norm(mpl.colors.LogNorm(vmin=1.0, vmax=100.0))
+    ax.add_collection3d(collection)
+    ax.set_xlim(0.0, 3.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_zlim(1.0, 100.0)
+    fig.colorbar(collection, ax=ax)
+
+    code = matplot2tikz.get_tikz_code(fig, include_disclaimer=False, float_format=".8g")
+    plt.close("all")
+
+    assert "point meta min=0" in code
+    assert "point meta max=1" in code
+    assert "0 1 2 0\\\\" in code
+    assert "3 4 5 0.5\\\\" in code
+    assert "6 7 8 1\\\\" in code
+    assert "ytick={0,0.5,1}" in code
+    assert r"\(\displaystyle {10^{0}}\)" in code
+    assert r"\(\displaystyle {10^{1}}\)" in code
+    assert r"\(\displaystyle {10^{2}}\)" in code
+
+
+def test_poly3d_lognorm_transforms_shader_vertex_meta() -> None:
+    fig = plt.figure()
+    ax = cast("Axes3D", fig.add_subplot(111, projection="3d"))
+    collection = Poly3DCollection(
+        [np.array([[0.0, 0.0, 1.0], [1.0, 0.0, 10.0], [0.0, 1.0, 100.0]])],
+        edgecolor="black",
+    )
+    collection.set_array(np.array([10.0]))
+    collection.set_cmap(plt.get_cmap("viridis"))
+    collection.set_norm(mpl.colors.LogNorm(vmin=1.0, vmax=100.0))
+    ax.add_collection3d(collection)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_zlim(1.0, 100.0)
+
+    code = matplot2tikz.get_tikz_code(
+        fig,
+        include_disclaimer=False,
+        float_format=".8g",
+        shader="interp",
+    )
+    plt.close("all")
+
+    assert r"point meta=\thisrow{meta}" in code
+    assert "point meta min=0" in code
+    assert "point meta max=1" in code
+    assert "x y z meta\\\\" in code
+    assert "0 0 1 0\\\\" in code
+    assert "1 0 10 0.5\\\\" in code
+    assert "0 1 100 1\\\\" in code
+
+
+def test_non_adjacent_quad_grid_uses_patch_fallback() -> None:
+    fig = plt.figure()
+    ax = cast("Axes3D", fig.add_subplot(111, projection="3d"))
+    collection = Poly3DCollection(
+        [
+            np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]]),
+            np.array([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 1.0, 0.0], [1.0, 1.0, 0.0]]),
+            np.array([[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [1.0, 2.0, 0.0], [0.0, 2.0, 0.0]]),
+            np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 2.0, 0.0], [0.0, 2.0, 0.0]]),
+        ],
+        edgecolor="black",
+    )
+    collection.set_array(np.arange(4.0))
+    collection.set_cmap(plt.get_cmap("viridis"))
+    ax.add_collection3d(collection)
+    ax.set_xlim(0.0, 2.0)
+    ax.set_ylim(0.0, 2.0)
+    ax.set_zlim(-1.0, 1.0)
+
+    code = matplot2tikz.get_tikz_code(fig, include_disclaimer=False, float_format=".8g")
+    plt.close("all")
+
+    assert "\\addplot3 [surf" not in code
+    assert "patch table with point meta" in code
 
 
 def test_clip3d_line_clips_to_axis_limits() -> None:
@@ -654,11 +889,27 @@ def test_3d_without_axis_environment() -> None:
 
 
 def test_3d_standalone_includes_dynamic_libraries() -> None:
-    code = _tikz_code(plot_surface_and_wireframe, standalone=True)
+    code = _tikz_code(plot_bar3d, standalone=True)
 
     assert "\\documentclass{standalone}" in code
     assert "\\usepgfplotslibrary{patchplots}" in code
     assert "\\begin{document}" in code
+
+
+def test_gallery_surface_wireframe_uses_log_z_and_color_meta() -> None:
+    code = _tikz_code(gallery_surface_wireframe)
+
+    assert "zmode=log" in code
+    assert "log basis z={10}" in code
+    assert "colorbar" in code
+    assert r"point meta=\thisrow{meta}" in code
+    assert "point meta min=0" in code
+    assert "point meta max=1" in code
+    assert "x y z meta\n" in code
+    assert "ytick={0.2,0.6,1}" in code
+    assert r"\(\displaystyle {10^{0}}\)" in code
+    assert r"\(\displaystyle {10^{1}}\)" in code
+    assert r"\(\displaystyle {10^{2}}\)" in code
 
 
 def test_3d_externalize_tables() -> None:
@@ -722,3 +973,16 @@ def _tikz_code(plot: Callable[[], Figure], **kwargs: Unpack[_TikzCodeOptions]) -
     code = matplot2tikz.get_tikz_code(fig, include_disclaimer=False, float_format=".8g", **kwargs)
     plt.close("all")
     return code
+
+
+def _regular_surface_point_meta_grid(code: str, *, rows: int, cols: int) -> np.ndarray:
+    table = code.split("table {%\n", maxsplit=1)[1].split("};", maxsplit=1)[0]
+    table_lines = table.strip().splitlines()
+    assert table_lines[0] == "x y z meta"
+
+    values = np.asarray(
+        [[float(part) for part in line.split()] for line in table_lines[1:]],
+        dtype=float,
+    )
+    assert values.shape == (rows * cols, 4)
+    return values[:, 3].reshape(rows, cols)

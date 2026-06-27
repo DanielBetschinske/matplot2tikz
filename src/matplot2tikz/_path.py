@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
     from ._tikzdata import TikzData
 
-from . import _color, _files
+from . import _color, _color_norm, _files
 from ._axes import _mpl_cmap2pgf_cmap
 from ._hatches import _mpl_hatch2pgfp_pattern
 from ._markers import _mpl_marker2pgfp_marker
@@ -163,10 +163,10 @@ def _check_x_is_date(data: TikzData) -> bool:
         msg = "No axes defined."
         raise ValueError(msg)
 
-    try:
-        converter = data.current_mpl_axes.xaxis.get_converter()  # type: ignore[attr-defined]
-    except AttributeError:
-        converter = data.current_mpl_axes.xaxis.converter
+    get_converter = getattr(data.current_mpl_axes.xaxis, "get_converter", None)
+    converter = (
+        get_converter() if callable(get_converter) else data.current_mpl_axes.xaxis.converter
+    )
     return isinstance(converter, DateConverter)
 
 
@@ -287,10 +287,13 @@ def make_pathcollection_data(
 def _draw_pathcollection_scatter_colormap(data: TikzData, pcd: PathCollectionData) -> None:
     obj_array = pcd.obj.get_array()
     if obj_array is not None:
-        colordata = [f"{value:{data.float_format}}" for value in np.ma.getdata(obj_array)]
+        color_values = _color_norm.color_meta_values(pcd.obj, np.ma.getdata(obj_array))
+        colordata = [f"{value:{data.float_format}}" for value in color_values]
         pcd.dd_strings = np.column_stack([pcd.dd_strings, colordata])
     pcd.labels.append("colordata")
     pcd.draw_options.append("scatter src=explicit")
+    if _color_norm.has_transformed_color_meta(pcd.obj):
+        pcd.draw_options.extend(_color_norm.point_meta_options(data, pcd.obj))
     coordinate_options = [f"{label}={label}" for label in pcd.labels if label in {"x", "y", "z"}]
     for option in coordinate_options:
         if option not in pcd.table_options:

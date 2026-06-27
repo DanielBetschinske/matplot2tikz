@@ -13,6 +13,13 @@ import numpy as np
 
 import matplot2tikz
 
+try:
+    import fitz
+except ImportError:
+    # fitz is only used for PDF to PNG conversion, so we can ignore it if it's not available.
+    fitz = None
+
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -27,6 +34,7 @@ TEX_DIR = EXAMPLE_DIR / "output" / "tex"
 PNG_DIR = EXAMPLE_DIR / "output" / "png"
 BUILD_DIR = EXAMPLE_DIR / "output" / "build"
 Clip3DMode = Literal["none", "hide", "clip"]
+ShaderMode = Literal["none", "interp"]
 
 
 def line_scatter_text() -> Figure:
@@ -58,19 +66,89 @@ def line_scatter_text() -> Figure:
 
 
 def surface_wireframe() -> Figure:
-    """Return a surface with an overlaid wireframe."""
+    """Return a logarithmic surface with an overlaid wireframe."""
     fig = plt.figure(figsize=(4.2, 3.2))
     ax = cast("Axes3D", fig.add_subplot(111, projection="3d"))
     x = np.linspace(-2.5, 2.5, 11)
     y = np.linspace(-2.5, 2.5, 11)
     xx, yy = np.meshgrid(x, y)
-    zz = np.sin(np.hypot(xx, yy))
-    ax.plot_surface(xx, yy, zz, cmap="viridis", edgecolor="black", linewidth=0.2, alpha=0.9)
-    ax.plot_wireframe(xx, yy, zz + 0.75, color="black", linewidth=0.45, rstride=2, cstride=2)
+    zz = 10 ** (2.0 - 0.25 * (xx**2 + 0.6 * yy**2))
+    norm = mpl.colors.LogNorm(vmin=float(np.min(zz)), vmax=float(np.max(zz)))
+    surface = ax.plot_surface(
+        xx,
+        yy,
+        zz,
+        cmap="viridis",
+        norm=norm,
+        edgecolor="black",
+        linewidth=0.2,
+        alpha=0.9,
+    )
+    ax.plot_wireframe(xx, yy, 1.8 * zz, color="black", linewidth=0.45, rstride=2, cstride=2)
+    fig.colorbar(surface, ax=ax, shrink=0.62, pad=0.12)
+    ax.set_zlim(0.25, 200.0)
+    ax.set_zscale("log")
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
     ax.view_init(elev=24.0, azim=-55.0)
+    return fig
+
+
+def exp_lognorm_surface() -> Figure:
+    """Return an exponential surface with explicit logarithmic color normalization."""
+    fig = plt.figure(figsize=(4.2, 3.2))
+    ax = cast("Axes3D", fig.add_subplot(111, projection="3d"))
+    x = np.arange(4.0)
+    y = np.arange(4.0)
+    xx, yy = np.meshgrid(x, y)
+    zz = np.exp(xx + yy)
+    face_z = (zz[:-1, :-1] + zz[:-1, 1:] + zz[1:, :-1] + zz[1:, 1:]) / 4.0
+    norm = mpl.colors.LogNorm(vmin=float(np.min(face_z)), vmax=float(np.max(face_z)))
+    surface = ax.plot_surface(
+        xx,
+        yy,
+        zz,
+        cmap="viridis",
+        norm=norm,
+        edgecolor="black",
+        linewidth=0.25,
+    )
+    fig.colorbar(surface, ax=ax, shrink=0.62, pad=0.12)
+    ax.set_zlim(1.0, float(np.exp(6.0)))
+    ax.set_zscale("log")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel(r"$e^{x+y}$")
+    ax.view_init(elev=26.0, azim=-48.0)
+    return fig
+
+
+def exp_lognorm_surface_interp() -> Figure:
+    """Return an exponential surface normalized for interpolated vertex coloring."""
+    fig = plt.figure(figsize=(4.2, 3.2))
+    ax = cast("Axes3D", fig.add_subplot(111, projection="3d"))
+    x = np.arange(4.0)
+    y = np.arange(4.0)
+    xx, yy = np.meshgrid(x, y)
+    zz = np.exp(xx + yy)
+    norm = mpl.colors.LogNorm(vmin=float(np.min(zz)), vmax=float(np.max(zz)))
+    surface = ax.plot_surface(
+        xx,
+        yy,
+        zz,
+        cmap="viridis",
+        norm=norm,
+        edgecolor="black",
+        linewidth=0.25,
+    )
+    fig.colorbar(surface, ax=ax, shrink=0.62, pad=0.12)
+    ax.set_zlim(1.0, float(np.exp(6.0)))
+    ax.set_zscale("log")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel(r"$e^{x+y}$")
+    ax.view_init(elev=26.0, azim=-48.0)
     return fig
 
 
@@ -221,16 +299,24 @@ def log_clipping() -> Figure:
     return fig
 
 
-EXAMPLES: tuple[tuple[str, str, Callable[[], Figure], Clip3DMode], ...] = (
-    ("line_scatter_text", "Line, scatter, text", line_scatter_text, "none"),
-    ("surface_wireframe", "Surface and wireframe", surface_wireframe, "none"),
-    ("contour_projection", "Contours and filled contours", contour_projection, "none"),
-    ("bar3d", "3D bars", bars, "none"),
-    ("quiver3d", "Semantic quiver", quiver, "none"),
-    ("log_clipping", "Log-scale clipping", log_clipping, "clip"),
-    ("clipping_none", "No clipping", clipping_surface_none, "none"),
-    ("clipping_hide", "Hide outside", clipping_surface_hide, "hide"),
-    ("clipping_clip", "Clip to limits", clipping_surface_clip, "clip"),
+EXAMPLES: tuple[tuple[str, str, Callable[[], Figure], Clip3DMode, ShaderMode], ...] = (
+    ("line_scatter_text", "Line, scatter, text", line_scatter_text, "none", "none"),
+    ("surface_wireframe", "Log surface and wireframe", surface_wireframe, "none", "none"),
+    ("exp_lognorm_surface", "Exponential LogNorm surface", exp_lognorm_surface, "none", "none"),
+    (
+        "exp_lognorm_surface_interp",
+        "Interpolated LogNorm surface",
+        exp_lognorm_surface_interp,
+        "none",
+        "interp",
+    ),
+    ("contour_projection", "Contours and filled contours", contour_projection, "none", "none"),
+    ("bar3d", "3D bars", bars, "none", "none"),
+    ("quiver3d", "Semantic quiver", quiver, "none", "none"),
+    ("log_clipping", "Log-scale clipping", log_clipping, "clip", "none"),
+    ("clipping_none", "No clipping", clipping_surface_none, "none", "none"),
+    ("clipping_hide", "Hide outside", clipping_surface_hide, "hide", "none"),
+    ("clipping_clip", "Clip to limits", clipping_surface_clip, "clip", "none"),
 )
 
 
@@ -240,15 +326,14 @@ def main() -> None:
     PNG_DIR.mkdir(parents=True, exist_ok=True)
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
 
-    expected_names = {name for name, _title, _plot, _clip_3d in EXAMPLES}
+    expected_names = {name for name, _title, _plot, _clip_3d, _shader in EXAMPLES}
     for output_dir, suffix in ((TEX_DIR, ".tex"), (PNG_DIR, ".png")):
         for path in output_dir.glob(f"*{suffix}"):
             if path.stem not in expected_names:
                 path.unlink()
 
     pdflatex = shutil.which("pdflatex")
-    pdftoppm = shutil.which("pdftoppm")
-    for name, _title, plot, clip_3d in EXAMPLES:
+    for name, _title, plot, clip_3d, shader in EXAMPLES:
         fig = plot()
         tex_path = TEX_DIR / f"{name}.tex"
         fig.savefig(BUILD_DIR / f"{name}_reference.png", dpi=fig.dpi)
@@ -259,10 +344,11 @@ def main() -> None:
             include_disclaimer=False,
             float_format=".8g",
             clip_3d=clip_3d,
+            shader=shader,
         )
         plt.close(fig)
 
-        if pdflatex is None or pdftoppm is None:
+        if pdflatex is None:
             continue
 
         subprocess.run(  # noqa: S603
@@ -278,14 +364,19 @@ def main() -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
         )
+        # Convert the generated PDF to PNG using fitz
+        if fitz is None:
+            continue
         pdf_path = BUILD_DIR / f"{name}.pdf"
         png_stem = PNG_DIR / name
-        subprocess.run(  # noqa: S603
-            [pdftoppm, "-png", "-singlefile", "-r", "170", str(pdf_path), str(png_stem)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
-        )
+        doc = fitz.open(pdf_path)
+        dpi = 300  # choose desired dpi
+        zoom = dpi / 72  # zoom factor, standard: 72 dpi
+        magnify = fitz.Matrix(zoom, zoom)
+
+        for page in doc:
+            pix = page.get_pixmap(matrix=magnify)
+            pix.save(f"{png_stem}.png")
 
 
 if __name__ == "__main__":

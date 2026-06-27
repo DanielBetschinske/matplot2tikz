@@ -38,7 +38,15 @@ from . import _quadmesh as qmsh
 from .__about__ import __version__
 from ._tikzdata import Flavors, TikzData
 
-ShaderMode = Literal["none", "interp"]
+ShaderMode = Literal[
+    "none",
+    "flat",
+    "interp",
+    "faceted",
+    "flat corner",
+    "flat mean",
+    "faceted interp",
+]
 
 # Set logger to be used to print some info
 LOGGER = logging.getLogger(__name__)
@@ -199,8 +207,11 @@ def get_tikz_code(  # noqa: PLR0913
                     ``"clip"`` clips supported lines and polygons to the limits.
     :type clip_3d: str
 
-    :param shader: Optional PGFPlots shader value for exported 3D patch plots,
-                   for example ``"interp"`` to emit ``shader=interp``.
+    :param shader: Optional PGFPlots shader value for exported 3D surfaces and patch plots.
+                   Supported values are ``"none"``, ``"flat"``, ``"flat corner"``,
+                   ``"flat mean"``, ``"faceted"``, ``"interp"``, and
+                   ``"faceted interp"``. The value ``"none"`` emits no explicit
+                   shader option.
     :type shader: str
 
     :param float_format: Format for float entities. Default is ```".15g"```.

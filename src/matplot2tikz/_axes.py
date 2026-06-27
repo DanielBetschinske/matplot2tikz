@@ -10,11 +10,12 @@ from matplotlib.axes import Subplot
 from matplotlib.colors import Colormap, LinearSegmentedColormap, ListedColormap
 from mpl_toolkits.mplot3d import Axes3D
 
-from . import _color
+from . import _color, _color_norm
 from ._util import _common_texification
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
+    from matplotlib.cm import ScalarMappable
     from matplotlib.colorbar import Colorbar
     from matplotlib.lines import Line2D
     from matplotlib.text import Text
@@ -337,28 +338,23 @@ class MyAxes:
         colorbar_styles = []
 
         orientation = colorbar.orientation
-        limits = colorbar.mappable.get_clim()
+        mappable = colorbar.mappable
         if orientation == "horizontal":
             self.data.current_axis_options.add("colorbar horizontal")
 
             colorbar_ticks = colorbar.ax.get_xticks()
             colorbar_ticks_minor = colorbar.ax.get_xticks(minor=True)
             axis_limits = colorbar.ax.get_xlim()
-
-            # In matplotlib, the colorbar color limits are determined by get_clim(), and
-            # the tick positions are as usual with respect to {x,y}lim. In PGFPlots,
-            # however, they are mixed together.  Hence, scale the tick positions just
-            # like {x,y}lim are scaled to clim.
-            colorbar_ticks = (colorbar_ticks - axis_limits[0]) / (
-                axis_limits[1] - axis_limits[0]
-            ) * (limits[1] - limits[0]) + limits[0]
-            colorbar_ticks_minor = (colorbar_ticks_minor - axis_limits[0]) / (
-                axis_limits[1] - axis_limits[0]
-            ) * (limits[1] - limits[0]) + limits[0]
             # Getting the labels via get_* might not actually be suitable:
             # they might not reflect the current state.
             colorbar_ticklabels = colorbar.ax.get_xticklabels()
             colorbar_ticklabels_minor = colorbar.ax.get_xticklabels(minor=True)
+            colorbar_ticks, colorbar_ticklabels = _get_colorbar_ticks(
+                mappable, colorbar_ticks, colorbar_ticklabels, axis_limits
+            )
+            colorbar_ticks_minor, colorbar_ticklabels_minor = _get_colorbar_ticks(
+                mappable, colorbar_ticks_minor, colorbar_ticklabels_minor, axis_limits
+            )
 
             colorbar_styles.extend(_get_ticks(self.data, "x", colorbar_ticks, colorbar_ticklabels))
             colorbar_styles.extend(
@@ -371,22 +367,17 @@ class MyAxes:
             colorbar_ticks_minor = colorbar.ax.get_yticks(minor=True)
             axis_limits = colorbar.ax.get_ylim()
 
-            # In matplotlib, the colorbar color limits are determined by get_clim(), and
-            # the tick positions are as usual with respect to {x,y}lim. In PGFPlots,
-            # however, they are mixed together.  Hence, scale the tick positions just
-            # like {x,y}lim are scaled to clim.
-            colorbar_ticks = (colorbar_ticks - axis_limits[0]) / (
-                axis_limits[1] - axis_limits[0]
-            ) * (limits[1] - limits[0]) + limits[0]
-            colorbar_ticks_minor = (colorbar_ticks_minor - axis_limits[0]) / (
-                axis_limits[1] - axis_limits[0]
-            ) * (limits[1] - limits[0]) + limits[0]
-
             # Getting the labels via get_* might not actually be suitable:
             # they might not reflect the current state.
             colorbar_ticklabels = colorbar.ax.get_yticklabels()
             colorbar_ylabel = colorbar.ax.get_ylabel()
             colorbar_ticklabels_minor = colorbar.ax.get_yticklabels(minor=True)
+            colorbar_ticks, colorbar_ticklabels = _get_colorbar_ticks(
+                mappable, colorbar_ticks, colorbar_ticklabels, axis_limits
+            )
+            colorbar_ticks_minor, colorbar_ticklabels_minor = _get_colorbar_ticks(
+                mappable, colorbar_ticks_minor, colorbar_ticklabels_minor, axis_limits
+            )
             colorbar_styles.extend(_get_ticks(self.data, "y", colorbar_ticks, colorbar_ticklabels))
             colorbar_styles.extend(
                 _get_ticks(self.data, "minor y", colorbar_ticks_minor, colorbar_ticklabels_minor)
@@ -396,15 +387,13 @@ class MyAxes:
             msg = f"Orientation must be either 'horizontal' or 'vertical', but is '{orientation}'."
             raise ValueError(msg)
 
-        mycolormap, is_custom_cmap = _mpl_cmap2pgf_cmap(colorbar.mappable.get_cmap(), self.data)
+        mycolormap, is_custom_cmap = _mpl_cmap2pgf_cmap(mappable.get_cmap(), self.data)
         if is_custom_cmap:
             self.data.current_axis_options.add("colormap=" + mycolormap)
         else:
             self.data.current_axis_options.add("colormap/" + mycolormap)
 
-        ff = self.data.float_format
-        self.data.current_axis_options.add(f"point meta min={limits[0]:{ff}}")
-        self.data.current_axis_options.add(f"point meta max={limits[1]:{ff}}")
+        self.data.current_axis_options.update(_color_norm.point_meta_options(self.data, mappable))
 
         if colorbar_styles:
             self.data.current_axis_options.add(
@@ -628,6 +617,52 @@ def _get_tick_position(obj: Axes, x_or_y: str) -> tuple[str | None, str | None]:
         position_string = f"{x_or_y}tick pos={major_ticks_position}"
 
     return position_string, major_ticks_position
+
+
+def _get_colorbar_ticks(
+    mappable: ScalarMappable,
+    ticks: Sequence[float] | np.ndarray,
+    ticklabels: Sequence[Text],
+    axis_limits: tuple[float, float],
+) -> tuple[np.ndarray, list[Text]]:
+    ticks_array = np.asarray(ticks, dtype=float)
+    ticklabel_list = list(ticklabels)
+    if not _color_norm.has_transformed_color_meta(mappable):
+        return _scale_colorbar_ticks_to_meta(mappable, ticks_array, axis_limits), ticklabel_list
+
+    if len(ticks_array) == 0:
+        return ticks_array, ticklabel_list
+
+    lower_limit, upper_limit = sorted(float(limit) for limit in axis_limits)
+    tolerance = 1.0e-12 * max(1.0, abs(lower_limit), abs(upper_limit))
+    tick_mask = (
+        np.isfinite(ticks_array)
+        & (ticks_array >= lower_limit - tolerance)
+        & (ticks_array <= upper_limit + tolerance)
+    )
+    transformed_ticks = _color_norm.color_meta_values(mappable, ticks_array[tick_mask])
+    return transformed_ticks, _filter_ticklabels(ticklabel_list, tick_mask)
+
+
+def _scale_colorbar_ticks_to_meta(
+    mappable: ScalarMappable,
+    ticks: np.ndarray,
+    axis_limits: tuple[float, float],
+) -> np.ndarray:
+    limits = _color_norm.point_meta_limits(mappable)
+    # In matplotlib, the colorbar color limits are determined by get_clim(), and
+    # the tick positions are as usual with respect to {x,y}lim. In PGFPlots,
+    # however, they are mixed together. Hence, scale the tick positions just
+    # like {x,y}lim are scaled to clim.
+    return (ticks - axis_limits[0]) / (axis_limits[1] - axis_limits[0]) * (
+        limits[1] - limits[0]
+    ) + limits[0]
+
+
+def _filter_ticklabels(ticklabels: list[Text], tick_mask: np.ndarray) -> list[Text]:
+    if len(ticklabels) != len(tick_mask):
+        return ticklabels
+    return [ticklabel for ticklabel, keep in zip(ticklabels, tick_mask, strict=True) if keep]
 
 
 def _get_ticks(
